@@ -34,6 +34,7 @@ Bolke de Bruin (bolke@xs4all.nl)
 from __future__ import absolute_import, print_function, division
 
 import struct
+import sasl
 import re
 
 from snakebite.protobuf.RpcHeader_pb2 import RpcRequestHeaderProto, RpcResponseHeaderProto, RpcSaslProto
@@ -41,7 +42,6 @@ from snakebite.config import HDFSConfig
 from snakebite import logger
 
 import google.protobuf.internal.encoder as encoder
-from puresasl.client import SASLClient
 
 # Configure package logging
 log = logger.getLogger(__name__)
@@ -84,61 +84,73 @@ class SaslRpcClient:
         # use service name component from principal
         service = re.split('[\/@]', str(self.hdfs_namenode_principal))[0]
 
-        if not self.sasl:
-            self.sasl = SASLClient(self._trans.host, service)
-
         negotiate = RpcSaslProto()
         negotiate.state = 1
         self._send_sasl_message(negotiate)
 
-        # do while true
+        if not self.sasl:
+            self.sasl = sasl.Client()
+            self.sasl.setAttr("service", service)
+            self.sasl.setAttr("host", self._trans.host)
+            self.sasl.init()
+
         while True:
-          res = self._recv_sasl_message()
-          # TODO: check mechanisms
-          if res.state == 1:
-            mechs = []
-            for auth in res.auths:
-                mechs.append(auth.mechanism)
+            res = self._recv_sasl_message()
 
-            log.debug("Available mechs: %s" % (",".join(mechs)))
-            self.sasl.choose_mechanism(mechs, allow_anonymous=False)
-            log.debug("Chosen mech: %s" % self.sasl.mechanism)
+            if res.state == 1:
+                mechs = []
+                for auth in res.auths:
+                    mechs.append(auth.mechanism)
 
-            initiate = RpcSaslProto()
-            initiate.state = 2
-            initiate.token = self.sasl.process()
+                log.debug("Available mechs: %s" % (",".join(mechs)))
+                s_mechs = str(",".join(mechs))
+                ret, chosen_mech, initial_response = self.sasl.start(s_mechs)
+                log.debug("Chosen mech: %s" % chosen_mech)
 
-            for auth in res.auths:
-                if auth.mechanism == self.sasl.mechanism:
-                    auth_method = initiate.auths.add()
-                    auth_method.mechanism = self.sasl.mechanism
-                    auth_method.method = auth.method
-                    auth_method.protocol = auth.protocol
-                    auth_method.serverId = self._trans.host
+                initiate = RpcSaslProto()
+                initiate.state = 2
+                initiate.token = initial_response
+                for auth in res.auths:
+                    if auth.mechanism == chosen_mech.decode():
+                        log.debug("chosen_mech.decode(): " + chosen_mech.decode())
+                        auth_method = initiate.auths.add()
+                        auth_method.mechanism = chosen_mech.decode()
+                        auth_method.method = auth.method
+                        auth_method.protocol = auth.protocol
+                        auth_method.serverId = self._trans.host
 
-            self._send_sasl_message(initiate)
-            continue
-           
-          if res.state == 3:
-            res_token = self._evaluate_token(res)
-            response = RpcSaslProto()
-            response.token = res_token
-            response.state = 4
-            self._send_sasl_message(response)
-            continue
+                self._send_sasl_message(initiate)
+                continue
 
-          if res.state == 0:
-            return True
+            if res.state == 3:
+                res_token = self._evaluate_token(res)
+                response = RpcSaslProto()
+                response.token = res_token
+                response.state = 4
+                self._send_sasl_message(response)
+                continue
+
+            if res.state == 0:
+                return True
 
     def _evaluate_token(self, sasl_response):
-        return self.sasl.process(challenge=sasl_response.token)
+        ret, response = self.sasl.step(sasl_response.token)
+        if not ret:
+            raise Exception("Bad SASL results: %s" % (self.sasl.getError()))
+
+        return response
 
     def wrap(self, message):
-        encoded = self.sasl.wrap(message)
-
+        ret, encoded = self.sasl.encode(message)
+        if not ret:
+            raise Exception("Cannot encode message: %s" % (self.sasl.getError()))
         sasl_message = RpcSaslProto()
         sasl_message.state = 5 #  WRAP
-        sasl_message.token = encoded
+        # Java follows RFC2222 meanwhile Cyrus Sasl follows 4422
+        # To make the two implementation to work, the first 4 bytes from
+        # the encrypted token are stripped.
+        # More info https://lists.andrew.cmu.edu/pipermail/cyrus-sasl/2017-March/003002.html
+        sasl_message.token = encoded[4:]
 
         self._send_sasl_message(sasl_message)
 
@@ -147,12 +159,22 @@ class SaslRpcClient:
         if response.state != 5:
             raise Exception("Server send non-wrapped response")
 
-        return self.sasl.unwrap(response.token)
+        # Java follows RFC2222 meanwhile Cyrus Sasl follows 4422
+        # To make the two implementation to work, the token returned by Java
+        # needs to be prefixed by 4 bytes representing its length.
+        # More info https://lists.andrew.cmu.edu/pipermail/cyrus-sasl/2017-March/003002.html
+        ret, decoded = self.sasl.decode(
+            struct.pack('!I', len(response.token)) + response.token)
+        if not ret:
+            raise Exception("Cannot decode message: %s" % (self.sasl.getError()))
+
+        return decoded
 
     def use_wrap(self):
         # SASL wrapping is only used if the connection has a QOP, and
         # the value is not auth.  ex. auth-int & auth-priv
-        if self.sasl.qop.decode() == 'auth-int' or self.sasl.qop.decode() == 'auth-conf':
-            return True
-        return False
+        ret, use_wrap = self.sasl.getSSF()
+        if not ret:
+            raise Exception("Cannot get negotiated security: %s" % (self.sasl.getError()))
+        return use_wrap
 
